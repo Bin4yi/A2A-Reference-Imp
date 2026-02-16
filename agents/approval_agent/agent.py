@@ -120,6 +120,83 @@ class ApprovalAgent:
             logger.info(f"[APPROVAL_AGENT] LLM classified -> action={classification['action']}")
             return classification
 
+    async def _llm_decide_approval(self, request_params: dict, original_query: str) -> dict:
+        """
+        Use LLM to intelligently decide whether to approve or deny an approval request.
+        Returns: {"decision": "approved"|"denied", "reason": "explanation"}
+        """
+        logger.info(f"[APPROVAL_AGENT] LLM deciding approval for: {request_params}")
+
+        decision_prompt = f"""You are an intelligent approval manager for an organization.
+Analyze the following approval request and decide whether to APPROVE or DENY it.
+
+Request Details:
+- Type: {request_params.get('request_type', 'access_request')}
+- Target User: {request_params.get('target_user', 'Unknown')}
+- Target Resource: {request_params.get('target_resource', 'N/A')}
+- Reason: {request_params.get('reason', 'No reason provided')}
+- Priority: {request_params.get('priority', 'normal')}
+
+Original Request: {original_query}
+
+Decision Criteria:
+1. APPROVE if:
+   - Reason is clear and valid
+   - Request seems reasonable for business operations
+   - User role/position seems appropriate
+   - No obvious security risks
+   - Standard onboarding/offboarding requests
+
+2. DENY if:
+   - Reason is vague, missing, or suspicious
+   - Request seems excessive or unusual
+   - Contains words like "urgent", "emergency" without proper justification
+   - Requests sensitive/privileged access without clear need
+   - Any indication of policy violation
+
+Respond with ONLY a JSON object (no markdown):
+{{
+  "decision": "approved" or "denied",
+  "reason": "Brief explanation (1 sentence)"
+}}
+"""
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.openai_api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "temperature": 0.3,  # Slight randomness for realistic decisions
+                    "messages": [
+                        {"role": "system", "content": "You are an approval decision engine. Always respond with valid JSON only."},
+                        {"role": "user", "content": decision_prompt}
+                    ]
+                }
+            )
+
+            if response.status_code != 200:
+                logger.error(f"[APPROVAL_AGENT] OpenAI error for decision: {response.status_code}")
+                # Default to denial if LLM fails
+                return {"decision": "denied", "reason": "Unable to verify approval criteria"}
+
+            result = response.json()
+            content = result["choices"][0]["message"]["content"].strip()
+
+            # Clean up markdown if present
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1] if "\n" in content else content[3:]
+                if content.endswith("```"):
+                    content = content[:-3]
+                content = content.strip()
+
+            decision = json.loads(content)
+            logger.info(f"[APPROVAL_AGENT] LLM decision -> {decision['decision']}: {decision['reason']}")
+            return decision
+
     async def _call_api(self, method: str, path: str, token: str, json_data: dict = None) -> Dict[str, Any]:
         """Make an authenticated call to the Approval API."""
         url = f"{APPROVAL_API_BASE}{path}"
@@ -201,17 +278,31 @@ class ApprovalAgent:
         if action == "create_request":
             result = await self.create_approval_request(params, token)
             if result.get("success"):
-                # Auto-approve for demo flow
                 created_id = result.get("request_id")
                 if created_id:
-                    approve_result = await self.approve_request(created_id, token)
-                    if approve_result.get("success"):
-                        return (
-                            f"✅ Approval request created and approved via API!\n"
-                            f"- ID: {approve_result.get('request_id', created_id)}\n"
-                            f"- Status: {approve_result.get('status', 'approved')}\n"
-                            f"- Approver: {approve_result.get('approved_by', 'N/A')}"
-                        )
+                    # Use LLM to decide whether to approve or deny
+                    decision = await self._llm_decide_approval(params, query)
+                    
+                    if decision["decision"] == "approved":
+                        approve_result = await self.approve_request(created_id, token)
+                        if approve_result.get("success"):
+                            return (
+                                f"✅ Approval request created and approved!\n"
+                                f"- ID: {approve_result.get('request_id', created_id)}\n"
+                                f"- Status: {approve_result.get('status', 'approved')}\n"
+                                f"- Reason: {decision['reason']}"
+                            )
+                    else:
+                        # Deny the request
+                        reject_result = await self.reject_request(created_id, token)
+                        if reject_result.get("success"):
+                            return (
+                                f"❌ Approval request created but DENIED!\n"
+                                f"- ID: {reject_result.get('request_id', created_id)}\n"
+                                f"- Status: {reject_result.get('status', 'rejected')}\n"
+                                f"- Reason: {decision['reason']}"
+                            )
+                
                 return (
                     f"✅ Approval request created via API!\n"
                     f"- ID: {result.get('request_id')}\n"

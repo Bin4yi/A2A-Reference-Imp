@@ -786,3 +786,62 @@ Respond ONLY with valid JSON."""
 
             combined = "\n\n".join(parts)
             yield {"content": combined}
+
+    async def run_with_langgraph(
+        self,
+        query: str,
+        context_id: str = "default",
+        access_token: str = None
+    ) -> Dict[str, Any]:
+        """
+        Process user query using LangGraph workflow.
+        This is an alternative to the stream() method that uses a stateful graph approach.
+        
+        Args:
+            query: User's request
+            context_id: Session context identifier
+            access_token: OAuth2 access token
+            
+        Returns:
+            Final state with aggregated results
+        """
+        try:
+            # Authentication check
+            session = self.get_or_create_session(context_id)
+            token = access_token or session.get('access_token')
+
+            if not token:
+                return {
+                    "error": "Not authenticated. Please login first.",
+                    "redirect": "/auth/login"
+                }
+
+            # Import LangGraph workflow
+            from agents.orchestrator.graph import run_orchestrator_workflow
+
+            # Execute LangGraph workflow
+            vlog(f"\n🚀 [LangGraph] Running orchestrator workflow for: {query[:100]}...")
+            
+            final_state = await run_orchestrator_workflow(
+                user_query=query,
+                access_token=token,
+                context_id=context_id
+            )
+
+            # Return structured result
+            return {
+                "success": final_state.get("error") is None,
+                "final_response": final_state.get("final_response"),
+                "task_results": final_state.get("task_results", []),
+                "task_plan": final_state.get("task_plan", []),
+                "error": final_state.get("error")
+            }
+
+        except Exception as e:
+            logger.exception("Error in run_with_langgraph")
+            return {
+                "success": False,
+                "error": str(e),
+                "final_response": f"Failed to execute workflow: {e}"
+            }
+
