@@ -232,11 +232,19 @@ header h1 {
 }
 
 .agent .node-icon {
-    width: 40px;
+    width: 100px;
     height: 40px;
-    font-size: 0.75rem;
+    font-size: 0.6rem;
     font-weight: 700;
     border-radius: 8px;
+    white-space: normal;
+    word-wrap: break-word;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 4px;
+    line-height: 1.1;
 }
 
 .api {
@@ -250,6 +258,19 @@ header h1 {
 
 .flow-node.api.active {
     background: var(--wso2-orange);
+}
+
+.mcp {
+    background: #9C27B0;
+    color: white;
+    padding: 6px 12px;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-weight: 600;
+}
+
+.flow-node.mcp.active {
+    background: #7B1FA2;
 }
 
 /* Tooltips */

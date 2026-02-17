@@ -49,16 +49,26 @@ Respond with ONLY a JSON object (no markdown, no explanation):
   }
 }
 
-Rules:
-- If request mentions create, submit, need approval, request access -> create_request
-- If request mentions approve, accept + a request ID -> approve_request
-- If request mentions reject, deny + a request ID -> reject_request
-- If request mentions get, check, details + a specific request ID -> get_request
-- If request mentions list, show, pending, status, check (without specific ID) -> list_requests
-- Extract request IDs matching pattern APR-XXXX
-- Extract target user names and emails from context
-- For list_requests, detect status filter (pending/approved/rejected)
-- Only include params that are actually mentioned
+CRITICAL CLASSIFICATION RULES:
+1. **CREATE vs APPROVE**:
+   - If request says "Approve/Review/Check request to GRANT/GIVE permissions" → create_request (NEW approval needed)
+   - If request says "Approve request APR-1234" (with APR-ID) → approve_request (EXISTING approval)
+   - If NO APR-ID is mentioned → create_request
+   - If APR-ID IS mentioned → approve_request/reject_request
+
+2. Other rules:
+   - If request mentions create, submit, need approval, request access → create_request
+   - If request mentions list, show, pending, status, check (without specific ID) → list_requests
+   - Extract request IDs matching pattern APR-XXXX
+   - Extract target user names and emails from context
+   - For list_requests, detect status filter (pending/approved/rejected)
+   - Only include params that are actually mentioned
+
+Examples:
+- "Approve request to grant IT permissions to Alice" → create_request (no APR-ID)
+- "Approve APR-1234" → approve_request (has APR-ID)
+- "Check if we can give Bob admin access" → create_request (no APR-ID)
+- "Reject request APR-5678" → reject_request (has APR-ID)
 """
 
 

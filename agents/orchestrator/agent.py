@@ -205,11 +205,18 @@ class OrchestratorAgent:
         self,
         agent_url: str,
         query: str,
-        access_token: str
+        access_token: str,
+        pre_exchanged_token: str = None
     ) -> Dict[str, Any]:
         """
         Call an agent using A2AClient.send_message() pattern.
         Includes visualizer logging for token flow animations.
+        
+        Args:
+            agent_url: URL of the target agent
+            query: User query/task to send to the agent
+            access_token: Source token (user delegated token)
+            pre_exchanged_token: Optional pre-exchanged token to skip token exchange
         """
         agent_info = self._discovered_agents.get(agent_url)
         if not agent_info:
@@ -243,48 +250,56 @@ class OrchestratorAgent:
             target_scopes = ["booking:read", "booking:write"]
 
         try:
-            # Log token exchange for visualizer
-            vlog(f"\n[TOKEN EXCHANGE FOR {agent_type}]")
-            vlog(f"  Agent: {agent_name}")
-            vlog(f"  URL: {agent_url}")
-            
-            # Log the source token (user delegated token)
-            vlog(f"\n[SOURCE_TOKEN - User Delegated]:")
-            vlog(f"  {access_token}")
-            
-            # Perform actual token exchange if agent_key is valid
-            exchanged_token = access_token  # fallback to original
-            
-            if agent_key:
-                try:
-                    broker = get_token_broker()
-                    # Extract target audience from agent URL
-                    # For now use a standard audience based on agent type
-                    target_audience = agent_key.replace("_", "-")  # e.g., "hr-agent"
-                    
-                    vlog(f"\n[PERFORMING TOKEN EXCHANGE]")
-                    vlog(f"  Subject Token: User Delegated Token")
-                    vlog(f"  Target Audience: {target_audience}")
-                    vlog(f"  Target Scopes: {target_scopes}")
-                    
-                    exchanged_token = await broker.exchange_token_for_agent(
-                        source_token=access_token,
-                        agent_key=agent_key,
-                        target_audience=target_audience,
-                        target_scopes=target_scopes
-                    )
-                    
-                    vlog(f"\n[{agent_type}_EXCHANGED_TOKEN]:")
-                    vlog(f"  {exchanged_token}")
-                    
-                except Exception as exc:
-                    vlog(f"\n[TOKEN EXCHANGE ERROR] {exc}")
-                    # Propagate error - don't silently fallback
-                    return {"error": f"Token exchange failed for {agent_type}: {exc}"}
+            # Use pre-exchanged token if provided, otherwise perform token exchange
+            if pre_exchanged_token:
+                vlog(f"\n[USING PRE-EXCHANGED TOKEN FOR {agent_type}]")
+                vlog(f"  Agent: {agent_name}")
+                vlog(f"  URL: {agent_url}")
+                vlog(f"  Token already exchanged by LangGraph")
+                exchanged_token = pre_exchanged_token
             else:
-                # Unknown agent type - still need token exchange
-                vlog(f"\n[WARNING] Unknown agent type: {agent_type} - cannot exchange token")
-                return {"error": f"Unknown agent type: {agent_type}"}
+                # Log token exchange for visualizer
+                vlog(f"\n[TOKEN EXCHANGE FOR {agent_type}]")
+                vlog(f"  Agent: {agent_name}")
+                vlog(f"  URL: {agent_url}")
+                
+                # Log the source token (user delegated token)
+                vlog(f"\n[SOURCE_TOKEN - User Delegated]:")
+                vlog(f"  {access_token}")
+                
+                # Perform actual token exchange if agent_key is valid
+                exchanged_token = access_token  # fallback to original
+                
+                if agent_key:
+                    try:
+                        broker = get_token_broker()
+                        # Extract target audience from agent URL
+                        # For now use a standard audience based on agent type
+                        target_audience = agent_key.replace("_", "-")  # e.g., "hr-agent"
+                        
+                        vlog(f"\n[PERFORMING TOKEN EXCHANGE]")
+                        vlog(f"  Subject Token: User Delegated Token")
+                        vlog(f"  Target Audience: {target_audience}")
+                        vlog(f"  Target Scopes: {target_scopes}")
+                        
+                        exchanged_token = await broker.exchange_token_for_agent(
+                            source_token=access_token,
+                            agent_key=agent_key,
+                            target_audience=target_audience,
+                            target_scopes=target_scopes
+                        )
+                        
+                        vlog(f"\n[{agent_type}_EXCHANGED_TOKEN]:")
+                        vlog(f"  {exchanged_token}")
+                        
+                    except Exception as exc:
+                        vlog(f"\n[TOKEN EXCHANGE ERROR] {exc}")
+                        # Propagate error - don't silently fallback
+                        return {"error": f"Token exchange failed for {agent_type}: {exc}"}
+                else:
+                    # Unknown agent type - still need token exchange
+                    vlog(f"\n[WARNING] Unknown agent type: {agent_type} - cannot exchange token")
+                    return {"error": f"Unknown agent type: {agent_type}"}
 
             async with httpx.AsyncClient() as httpx_client:
                 # Build message using SDK types
@@ -740,11 +755,8 @@ Respond ONLY with valid JSON."""
         access_token: str = None
     ) -> AsyncIterable[Dict[str, Any]]:
         """
-        Process user query:
-        1. Check authentication
-        2. Decompose into tasks via LLM
-        3. Execute each task against the appropriate agent
-        4. Yield combined results
+        Process user query using LangGraph workflow.
+        Yields results incrementally for streaming responses.
         """
         session = self.get_or_create_session(context_id)
         token = access_token or session.get('access_token')
@@ -757,35 +769,22 @@ Respond ONLY with valid JSON."""
             }
             return
 
-        # Use process_workflow for all requests (handles single and multi-agent)
-        logger.info(f"Processing: {query[:50]}...")
-
-        result = await self.process_workflow(
-            user_input=query,
-            access_token=token,
-            context_id=context_id
-        )
-
-        if result.get("status") == "error":
-            yield {"content": f"Error: {result.get('error', 'Unknown error')}"}
-            return
-
-        # Build a combined response from all step results
-        parts = []
-        plan = result.get("plan", [])
-        results = result.get("results", [])
-
-        if len(results) == 1:
-            # Single agent — just return its response
-            yield {"content": results[0].get("response", "")}
-        else:
-            # Multiple agents — format as a summary
-            for r in results:
-                status_icon = "✅" if r["status"] == "success" else "❌"
-                parts.append(f"{status_icon} **{r['agent']}**: {r['response']}")
-
-            combined = "\n\n".join(parts)
-            yield {"content": combined}
+        # Run LangGraph workflow
+        logger.info(f"Processing with LangGraph: {query[:50]}...")
+        
+        try:
+            result = await self.run_with_langgraph(query, context_id, token)
+            
+            if result.get("error"):
+                yield {"content": f"Error: {result['error']}"}
+                return
+            
+            # Yield the final response
+            yield {"content": result.get("final_response", "Workflow completed")}
+            
+        except Exception as e:
+            logger.exception("Error in stream")
+            yield {"content": f"Error: {str(e)}"}
 
     async def run_with_langgraph(
         self,

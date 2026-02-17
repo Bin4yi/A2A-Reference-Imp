@@ -8,14 +8,15 @@ The MCP server:
 1. Exposes a smart tool: handle_it_request
    - Uses OpenAI LLM to classify the incoming request
    - Routes to the correct internal function (vpn/github/aws/list)
-2. Performs RFC 8693 token exchange (no actor token) to narrow scope:
+2. Performs RFC 8693 token exchange (WITH actor token) to narrow scope:
    - Write operations → exchanges to it:write only
    - Read operations → exchanges to it:read only
+   - Maintains delegation chain via actor_token parameter
 3. Calls the IT API with the narrowed token
 
-Token Exchange (simplified, no actor token):
-  Uses Token Exchanger app credentials + subject_token → narrowed token
-  WSO2 IS supports token exchange without actor_token for scope narrowing.
+Token Exchange (with actor token):
+  Uses Token Exchanger app credentials + subject_token + actor_token → narrowed token
+  WSO2 IS maintains the delegation chain through scope narrowing exchanges.
 """
 
 import os
@@ -127,7 +128,7 @@ async def exchange_token_for_scope(
     except Exception as e:
         await vlog(f"  [DEBUG] Failed to decode source token: {e}")
 
-    await vlog(f"\n[STEP 1: SCOPE-NARROWING TOKEN EXCHANGE (No Actor Token)]")
+    await vlog(f"\n[STEP 1: SCOPE-NARROWING TOKEN EXCHANGE (With Actor Token)]")
     await vlog(f"  Subject: IT Agent Token")
     await vlog(f"  Token Exchanger App: {TOKEN_EXCHANGER_CLIENT_ID}")
     await vlog(f"  Target Scope: {target_scope}")
@@ -137,10 +138,13 @@ async def exchange_token_for_scope(
         f"{TOKEN_EXCHANGER_CLIENT_ID}:{TOKEN_EXCHANGER_CLIENT_SECRET}".encode()
     ).decode()
 
+    # RFC 8693 Token Exchange WITH actor token to maintain delegation chain
     data = {
         "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
         "subject_token": subject_token,
         "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "actor_token": subject_token,  # Same token acts as actor for scope narrowing
+        "actor_token_type": "urn:ietf:params:oauth:token-type:access_token",
         "scope": target_scope,
     }
 

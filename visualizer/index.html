@@ -83,7 +83,7 @@
                                     d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" />
                             </svg>
                         </div>
-                        <span class="node-label">Orchestrator</span>
+                        <span class="node-label">Orchestrator Agent</span>
                         <div class="tooltip">Manages workflow logic, aggregates results, sends final response</div>
                     </div>
                 </div>
@@ -118,7 +118,7 @@
                         <!-- HR -->
                         <div class="agent-path">
                             <div class="flow-node agent" id="node-hr">
-                                <div class="node-icon hr">HR</div>
+                                <div class="node-icon hr">HR Agent</div>
                                 <div class="tooltip">HR Agent<br>Creates Employee Profiles</div>
                             </div>
                             <div class="connector small" id="conn-hr-api">
@@ -132,7 +132,7 @@
                         <!-- Booking -->
                         <div class="agent-path">
                             <div class="flow-node agent" id="node-booking">
-                                <div class="node-icon booking">BK</div>
+                                <div class="node-icon booking">Booking Agent</div>
                                 <div class="tooltip">Booking Agent<br>Schedules Orientation</div>
                             </div>
                             <div class="connector small" id="conn-booking-api">
@@ -146,10 +146,16 @@
                         <!-- IT -->
                         <div class="agent-path">
                             <div class="flow-node agent" id="node-it">
-                                <div class="node-icon it">IT</div>
+                                <div class="node-icon it">IT Agent</div>
                                 <div class="tooltip">IT Agent<br>Provisions VPN, Email, etc.</div>
                             </div>
-                            <div class="connector small" id="conn-it-api">
+                            <div class="connector small" id="conn-it-mcp">
+                                <div class="connector-line"></div>
+                                <div class="packet forward"></div>
+                                <div class="packet reverse"></div>
+                            </div>
+                            <div class="flow-node mcp" id="node-it-mcp">MCP</div>
+                            <div class="connector small" id="conn-mcp-api">
                                 <div class="connector-line"></div>
                                 <div class="packet forward"></div>
                                 <div class="packet reverse"></div>
@@ -160,7 +166,7 @@
                         <!-- Approval -->
                         <div class="agent-path">
                             <div class="flow-node agent" id="node-approval">
-                                <div class="node-icon approval">AP</div>
+                                <div class="node-icon approval">Approval Agent</div>
                                 <div class="tooltip">
                                     <strong>Approval Agent</strong><br>
                                     Manages high-risk permission requests.<br>
@@ -199,9 +205,6 @@
                 <a href="http://localhost:8000/auth/login" target="_blank" class="action-btn login">
                     🔑 Login First
                 </a>
-                <button class="action-btn demo" onclick="runDefaultDemo()">
-                    ▶️ Run Demo
-                </button>
             </div>
             <div class="response-panel" id="response-panel">
                 <div class="response-header">

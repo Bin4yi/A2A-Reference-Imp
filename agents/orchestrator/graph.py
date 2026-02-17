@@ -39,8 +39,8 @@ class OrchestratorState(TypedDict):
     current_task_index: int
     task_results: List[Dict[str, Any]]  # [{step, agent, result}]
     
-    # Approval tracking
-    approval_status: str | None  # "pending", "approved", "denied"
+    # Approval tracking - List of all approval decisions
+    approval_decisions: List[Dict[str, str]]  # [{"task": "...", "status": "approved"|"denied", "reason": "..."}]
     
     # Messages for LLM conversation
     messages: Annotated[List, "Messages for LLM context"]
@@ -109,11 +109,41 @@ Return a JSON array of tasks in this exact format:
   {{"step": 2, "agent_name": "IT Agent", "agent_url": "http://localhost:8002", "task": "Provision accounts for new employee"}}
 ]
 
-Rules:
-- Only use agents that are actually available
-- Tasks should be specific and actionable
-- Order tasks logically (dependencies first)
-- Return ONLY the JSON array, no other text
+CRITICAL RULES:
+1. **SEPARATE APPROVALS FOR MIXED-RISK REQUESTS**: 
+   - If a request contains BOTH high-risk and low-risk operations, create SEPARATE approval tasks for each
+   - Example: "Give Bob high-level HR privileges AND normal IT access" should become:
+     * Approval 1 (high-risk): "Approve high-level HR privileges for Bob"
+     * HR task execution
+     * Approval 2 (low-risk): "Approve normal IT access for Bob"  
+     * IT task execution
+   - This allows low-risk operations to proceed even if high-risk ones are denied
+   
+2. **APPROVAL BEFORE EXECUTION**: Each privileged operation should have its approval immediately before execution, not all approvals at the start
+
+3. **CONSOLIDATE AGENT TASKS**: If multiple operations can be done by the SAME agent with SAME risk level, combine them into ONE task
+   - Example: Instead of 3 separate IT tasks (VPN, GitHub, AWS), create 1 task: "Provision VPN, GitHub, and AWS access for Alice"
+   - This reduces token exchanges and improves efficiency
+
+4. Only use agents that are actually available
+5. Tasks should be specific and actionable
+6. Return ONLY the JSON array, no other text
+
+Example for MIXED-RISK request:
+Request: "Give Bob high-level HR privileges and normal IT access"
+[
+  {{"step": 1, "agent_name": "Approval Agent", "agent_url": "http://localhost:8003", "task": "Approve request to grant high-level HR privileges to Bob"}},
+  {{"step": 2, "agent_name": "HR Agent", "agent_url": "http://localhost:8001", "task": "Grant high-level HR privileges to Bob"}},
+  {{"step": 3, "agent_name": "Approval Agent", "agent_url": "http://localhost:8003", "task": "Approve request to grant normal IT access to Bob"}},
+  {{"step": 4, "agent_name": "IT Agent", "agent_url": "http://localhost:8002", "task": "Grant normal IT privileges to Bob"}}
+]
+
+Example for SAME-RISK request (consolidate):
+Request: "Give Alice VPN, GitHub, and AWS access"
+[
+  {{"step": 1, "agent_name": "Approval Agent", "agent_url": "http://localhost:8003", "task": "Approve request to provision IT access for Alice"}},
+  {{"step": 2, "agent_name": "IT Agent", "agent_url": "http://localhost:8002", "task": "Provision VPN, GitHub, and AWS access for Alice"}}
+]
 """
     
     messages = [
@@ -146,16 +176,52 @@ Rules:
 async def execute_task_node(state: OrchestratorState) -> OrchestratorState:
     """
     Node 3: Execute the current task by calling the appropriate agent.
+    Skips tasks whose approval was denied.
     """
     task_idx = state["current_task_index"]
     task_plan = state["task_plan"]
     
+    # Safety check: prevent infinite loop
     if task_idx >= len(task_plan):
-        # No more tasks to execute
+        logger.warning(f"⚠️ [LangGraph] Task index {task_idx} >= plan length {len(task_plan)}, stopping")
         return state
     
     current_task = task_plan[task_idx]
     logger.info(f"🚀 [LangGraph] Executing task {task_idx + 1}/{len(task_plan)}: {current_task['task']}")
+    
+    # Check if this task's approval was denied
+    approval_decisions = state.get("approval_decisions", [])
+    current_step = current_task.get("step")
+    
+    # Find if there's a denied approval for this task
+    denied_approval = None
+    for approval in approval_decisions:
+        if approval.get("linked_task_step") == current_step and approval["status"] == "denied":
+            denied_approval = approval
+            break
+    
+    if denied_approval:
+        logger.warning(f"⚠️ [LangGraph] Skipping task {task_idx + 1} - approval was denied")
+        logger.warning(f"   Reason: {denied_approval['reason'][:100]}")
+        
+        # Record skipped task
+        task_result = {
+            "step": current_task["step"],
+            "agent": current_task["agent_name"],
+            "task": current_task["task"],
+            "result": f"⏭️ SKIPPED - Approval denied: {denied_approval['reason'][:100]}",
+            "success": False,
+            "skipped": True
+        }
+        
+        task_results = state.get("task_results", [])
+        task_results = task_results + [task_result]
+        
+        return {
+            **state,
+            "current_task_index": task_idx + 1,
+            "task_results": task_results
+        }
     
     # Import here to avoid circular dependencies
     from agents.orchestrator.agent import OrchestratorAgent
@@ -204,16 +270,49 @@ async def execute_task_node(state: OrchestratorState) -> OrchestratorState:
             source_token=state["access_token"],
             agent_key=agent_key,
             target_audience=current_task["agent_name"].lower().replace(" ", "-"),
-            target_scopes=agent_scopes.get(agent_key, [])
+            target_scopes=agent_scopes  # agent_scopes is already a list
         )
         
-        # Call the agent
+        # Call the agent with pre-exchanged token (avoid duplicate exchange)
         orchestrator = OrchestratorAgent()
-        result = await orchestrator.call_agent(
+        agent_response = await orchestrator.call_agent(
             agent_url=current_task["agent_url"],
             query=current_task["task"],
-            access_token=agent_token
+            access_token=state["access_token"],
+            pre_exchanged_token=agent_token  # Pass pre-exchanged token to skip duplicate exchange
         )
+        
+        # Extract result from A2A response
+        if isinstance(agent_response, dict):
+            if "error" in agent_response:
+                result = agent_response["error"]
+                success = False
+            elif "result" in agent_response:
+                # A2A JSON-RPC response
+                result_data = agent_response.get("result", {})
+                
+                if isinstance(result_data, list):
+                    # Result is a list - stringify it
+                    result = str(result_data)
+                    success = True
+                elif isinstance(result_data, dict):
+                    # Extract text from message parts
+                    message = result_data.get("message", {})
+                    parts = message.get("parts", [])
+                    if parts and isinstance(parts, list):
+                        result = parts[0].get("text", str(result_data))
+                    else:
+                        result = str(result_data)
+                    success = True
+                else:
+                    result = str(result_data)
+                    success = True
+            else:
+                result = str(agent_response)
+                success = True
+        else:
+            result = str(agent_response)
+            success = True
         
         logger.info(f"✅ [LangGraph] Task {task_idx + 1} completed successfully")
         
@@ -222,21 +321,36 @@ async def execute_task_node(state: OrchestratorState) -> OrchestratorState:
             "agent": current_task["agent_name"],
             "task": current_task["task"],
             "result": result,
-            "success": True
+            "success": success
         }
         
-        # Check if this was an approval task and update approval status
-        new_approval_status = state.get("approval_status")
+        # Check if this was an approval task and track the decision
+        approval_decisions = state.get("approval_decisions", [])
         if "approval" in current_task["agent_name"].lower():
             result_lower = str(result).lower()
+            decision_status = None
+            
             if "approved" in result_lower or "approval granted" in result_lower:
-                new_approval_status = "approved"
+                decision_status = "approved"
                 logger.info("✅ [LangGraph] Approval granted")
-            elif "denied" in result_lower or "rejected" in result_lower:
-                new_approval_status = "denied"
-                logger.warning("❌ [LangGraph] Approval denied")
-            else:
-                new_approval_status = "pending"
+            elif "denied" in result_lower or "rejected" in result_lower or "failed" in result_lower or "error" in result_lower:
+                # Treat errors/failures as denial
+                decision_status = "denied"
+                logger.warning(f"❌ [LangGraph] Approval denied or failed: {result[:100]}")
+            
+            if decision_status:
+                # Link approval to the next task (assumes approval task is immediately before execution task)
+                next_task_idx = task_idx + 1
+                linked_task_step = None
+                if next_task_idx < len(task_plan):
+                    linked_task_step = task_plan[next_task_idx].get("step")
+                
+                approval_decisions = approval_decisions + [{
+                    "task": current_task["task"],
+                    "status": decision_status,
+                    "reason": str(result),
+                    "linked_task_step": linked_task_step  # Link approval to its execution task
+                }]
         
     except Exception as e:
         logger.error(f"❌ [LangGraph] Task {task_idx + 1} failed: {e}")
@@ -247,13 +361,13 @@ async def execute_task_node(state: OrchestratorState) -> OrchestratorState:
             "result": str(e),
             "success": False
         }
-        new_approval_status = state.get("approval_status")
+        approval_decisions = state.get("approval_decisions", [])
     
     return {
         **state,
         "current_task_index": task_idx + 1,
         "task_results": state["task_results"] + [task_result],
-        "approval_status": new_approval_status,
+        "approval_decisions": approval_decisions,
         "messages": state.get("messages", []) + [
             AIMessage(content=f"Completed: {current_task['task']}")
         ]
@@ -268,12 +382,23 @@ async def aggregate_results_node(state: OrchestratorState) -> OrchestratorState:
     
     # Build final response
     results_summary = []
-    for task_result in state["task_results"]:
-        status = "✅" if task_result["success"] else "❌"
-        results_summary.append(
-            f"{status} Step {task_result['step']}: {task_result['agent']} - {task_result['task']}\n"
-            f"   Result: {task_result['result']}"
-        )
+    for idx, task_result in enumerate(state["task_results"]):
+        # Debug logging
+        logger.debug(f"Task result {idx}: type={type(task_result)}, value={task_result}")
+        
+        # Safely access task_result - handle both dict and unexpected types
+        if isinstance(task_result, dict):
+            status = "✅" if task_result.get("success", False) else "❌"
+            results_summary.append(
+                f"{status} Step {task_result.get('step', idx+1)}: {task_result.get('agent', 'Unknown')} - {task_result.get('task', 'N/A')}\n"
+                f"   Result: {task_result.get('result', 'No result')}"
+            )
+        else:
+            # Handle unexpected type
+            logger.error(f"❌ Unexpected task_result type: {type(task_result)}")
+            results_summary.append(
+                f"❌ Step {idx+1}: Error - Invalid result format: {str(task_result)}"
+            )
     
     final_response = "\n\n".join(results_summary)
     
@@ -292,17 +417,23 @@ async def aggregate_results_node(state: OrchestratorState) -> OrchestratorState:
 def should_continue_execution(state: OrchestratorState) -> str:
     """
     Decides whether to continue executing tasks or move to aggregation.
-    Stops workflow if approval was denied.
+    With partial approval support: workflow continues even if some approvals are denied.
+    Individual denied tasks are skipped in execute_task_node.
     """
-    # Check if approval was denied
-    if state.get("approval_status") == "denied":
-        logger.warning("⚠️ [LangGraph] Stopping workflow - approval denied")
-        return "aggregate"
+    # Note: We removed the "stop on ANY denial" logic to support partial approvals
+    # Individual tasks with denied approvals are now skipped in execute_task_node
     
     # Continue if there are more tasks
-    if state["current_task_index"] < len(state["task_plan"]):
+    current_idx = state["current_task_index"]
+    total_tasks = len(state["task_plan"])
+    
+    logger.info(f"🔍 [LangGraph] Routing decision: index={current_idx}, total={total_tasks}")
+    
+    if current_idx < total_tasks:
+        logger.info(f"   → Continuing to execute_task (task {current_idx + 1})")
         return "execute_task"
     else:
+        logger.info(f"   → Moving to aggregate (all tasks complete)")
         return "aggregate"
 
 
@@ -379,7 +510,7 @@ async def run_orchestrator_workflow(
         "task_plan": [],
         "current_task_index": 0,
         "task_results": [],
-        "approval_status": None,
+        "approval_decisions": [],
         "messages": [HumanMessage(content=user_query)],
         "final_response": "",
         "error": None
